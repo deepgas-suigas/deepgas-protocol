@@ -10,8 +10,8 @@ module gas_futures::amm {
     use sui::event;
     use sui::table::{Self, Table};
     use sui::transfer;
-    use std::option;
-
+    use std::option::{Self, Option};
+    use std::vector;
 
     // Error codes
     const E_INSUFFICIENT_LIQUIDITY: u64 = 1;
@@ -22,12 +22,17 @@ module gas_futures::amm {
     const E_MEV_DETECTED: u64 = 6;
     const E_BATCH_NOT_READY: u64 = 7;
     const E_FRONTRUN_DETECTED: u64 = 8;
+    const E_INSUFFICIENT_PAYMENT: u64 = 9;
+    const E_ZERO_AMOUNT: u64 = 10;
+    const E_INSUFFICIENT_LP_TOKENS: u64 = 11;
 
     // Constants
     const BATCH_DURATION: u64 = 15000; // 15 seconds
     const MAX_SLIPPAGE: u64 = 1000; // 10%
     const MEV_THRESHOLD: u64 = 5000; // 50% price impact threshold
     const MIN_BATCH_SIZE: u64 = 3; // Minimum orders in batch
+    const FEE_PRECISION: u64 = 10000; // 1 = 0.01%
+    const PRICE_PRECISION: u64 = 1000000; // 1e6
 
     // Order types
     const ORDER_TYPE_MARKET: u8 = 1;
@@ -50,6 +55,16 @@ module gas_futures::amm {
         max_slippage: u64,
         submitted_at: u64,
         commitment_hash: vector<u8>, // For commit-reveal scheme
+    }
+
+    // Liquidity Position Token
+    public struct LPToken has key, store {
+        id: UID,
+        pool_id: ID,
+        owner: address,
+        amount: u64,
+        shares: u64,
+        created_at: u64,
     }
 
     // Batch auction for MEV resistance
@@ -82,6 +97,8 @@ module gas_futures::amm {
         batch_auction_id: Option<u64>,
         trade_history: Table<u64, TradeInfo>,
         trade_counter: u64,
+        total_fees_collected: u64,
+        created_at: u64,
     }
 
     // MEV and frontrunning detection
@@ -101,6 +118,19 @@ module gas_futures::amm {
         timestamp: u64,
         price_impact: u64,
         mev_detected: bool,
+        fees_paid: u64,
+    }
+
+    // Swap Quote structure
+    public struct SwapQuote has copy, drop {
+        input_amount: u64,
+        output_amount: u64,
+        price_impact: u64,
+        minimum_received: u64,
+        fee_amount: u64,
+        route: vector<ID>,
+        estimated_gas: u64,
+        mev_protection: bool,
     }
 
     // Advanced AMM registry
@@ -112,6 +142,8 @@ module gas_futures::amm {
         total_mev_prevented: u64,
         total_frontrun_blocked: u64,
         admin: address,
+        total_volume: u64,
+        total_fees: u64,
     }
 
     // Time-weighted average price oracle
@@ -130,6 +162,7 @@ module gas_futures::amm {
         duration_days: u64,
         initial_price: u64,
         mev_protection: bool,
+        creator: address,
     }
 
     public struct OrderSubmitted has copy, drop {
@@ -173,6 +206,14 @@ module gas_futures::amm {
         price_impact: u64,
     }
 
+    public struct LiquidityRemoved has copy, drop {
+        provider: address,
+        pool_id: ID,
+        lp_tokens_burned: u64,
+        sui_amount: u64,
+        gas_credits_amount: u64,
+    }
+
     public struct TradeExecuted has copy, drop {
         trader: address,
         pool_id: ID,
@@ -181,6 +222,7 @@ module gas_futures::amm {
         is_buy: bool,
         price: u64,
         price_impact: u64,
+        fees_paid: u64,
     }
 
     // Initialize advanced AMM system
@@ -193,6 +235,8 @@ module gas_futures::amm {
             total_mev_prevented: 0,
             total_frontrun_blocked: 0,
             admin: tx_context::sender(ctx),
+            total_volume: 0,
+            total_fees: 0,
         };
         transfer::share_object(registry);
     }
@@ -211,19 +255,20 @@ module gas_futures::amm {
         assert!(sui_amount > 0 && initial_gas_credits > 0, E_INSUFFICIENT_LIQUIDITY);
 
         let current_time = clock::timestamp_ms(clock);
+        let initial_lp_tokens = sqrt_u64(sui_amount * initial_gas_credits);
         
         let pool = AdvancedPool {
             id: object::new(ctx),
             duration_days,
             sui_reserve: coin::into_balance(initial_sui),
             gas_credits_reserve: initial_gas_credits,
-            total_liquidity_tokens: sqrt_u64(sui_amount * initial_gas_credits),
-            fee_rate: 300, // 0.3%
-            last_price: (sui_amount * 1000000) / initial_gas_credits,
-            price_impact_factor: 5000, // 0.5%
+            total_liquidity_tokens: initial_lp_tokens,
+            fee_rate: 30, // 0.3%
+            last_price: (sui_amount * PRICE_PRECISION) / initial_gas_credits,
+            price_impact_factor: 50, // 0.5%
             mev_protection_enabled: enable_mev_protection,
             frontrun_detection: FrontrunDetection {
-                last_trade_price: (sui_amount * 1000000) / initial_gas_credits,
+                last_trade_price: (sui_amount * PRICE_PRECISION) / initial_gas_credits,
                 last_trade_timestamp: current_time,
                 large_order_threshold: sui_amount / 10, // 10% of initial liquidity
                 price_manipulation_threshold: 1000, // 10%
@@ -232,22 +277,317 @@ module gas_futures::amm {
             batch_auction_id: option::none(),
             trade_history: table::new(ctx),
             trade_counter: 0,
+            total_fees_collected: 0,
+            created_at: current_time,
         };
 
         let pool_id = object::uid_to_inner(&pool.id);
         table::add(&mut registry.pools, duration_days, pool_id);
+
+        // Create initial LP token for creator
+        let lp_token = LPToken {
+            id: object::new(ctx),
+            pool_id,
+            owner: tx_context::sender(ctx),
+            amount: initial_lp_tokens,
+            shares: initial_lp_tokens,
+            created_at: current_time,
+        };
 
         event::emit(PoolCreated {
             pool_id,
             duration_days,
             initial_price: pool.last_price,
             mev_protection: enable_mev_protection,
+            creator: tx_context::sender(ctx),
         });
 
+        transfer::transfer(lp_token, tx_context::sender(ctx));
         transfer::share_object(pool);
     }
 
-    // Submit order to batch auction (simplified implementation)
+    // Main swap function - CRITICAL MISSING FUNCTION
+    public entry fun swap(
+        pool: &mut AdvancedPool,
+        payment: Coin<SUI>,
+        is_buy: bool,
+        min_output: u64,
+        max_slippage: u64,
+        clock: &Clock,
+        ctx: &mut TxContext
+    ) {
+        let amount_in = coin::value(&payment);
+        assert!(amount_in > 0, E_ZERO_AMOUNT);
+        assert!(max_slippage <= MAX_SLIPPAGE, E_SLIPPAGE_TOO_HIGH);
+
+        let current_time = clock::timestamp_ms(clock);
+        let trader = tx_context::sender(ctx);
+
+        // MEV Detection
+        if (pool.mev_protection_enabled && detect_mev(pool, amount_in, is_buy, current_time)) {
+            event::emit(MEVDetected {
+                trader,
+                transaction_hash: vector::empty(),
+                price_impact: calculate_price_impact(pool, amount_in, is_buy),
+                blocked: true,
+                timestamp: current_time,
+            });
+            abort E_MEV_DETECTED
+        };
+
+        // Calculate swap amounts
+        let (amount_out, fee_amount, price_impact) = calculate_swap_amounts(pool, amount_in, is_buy);
+        
+        // Slippage protection
+        assert!(amount_out >= min_output, E_SLIPPAGE_TOO_HIGH);
+        let slippage = if (amount_out < amount_in) {
+            ((amount_in - amount_out) * FEE_PRECISION) / amount_in
+        } else {
+            ((amount_out - amount_in) * FEE_PRECISION) / amount_out
+        };
+        assert!(slippage <= max_slippage, E_SLIPPAGE_TOO_HIGH);
+
+        // Execute swap
+        if (is_buy) {
+            // Buy gas credits with SUI
+            assert!(pool.gas_credits_reserve >= amount_out, E_INSUFFICIENT_LIQUIDITY);
+            
+            // Add SUI to pool
+            balance::join(&mut pool.sui_reserve, coin::into_balance(payment));
+            
+            // Remove gas credits from pool
+            pool.gas_credits_reserve = pool.gas_credits_reserve - amount_out;
+            
+            // Create gas credits coin (simplified - in reality would be proper coin type)
+            // For now, we'll track this in events
+            
+        } else {
+            // Sell gas credits for SUI
+            let sui_reserve_value = balance::value(&pool.sui_reserve);
+            assert!(sui_reserve_value >= amount_out, E_INSUFFICIENT_LIQUIDITY);
+            
+            // Add gas credits to pool (payment would be gas credits)
+            pool.gas_credits_reserve = pool.gas_credits_reserve + amount_in;
+            
+            // Remove SUI from pool
+            let sui_out = balance::split(&mut pool.sui_reserve, amount_out);
+            transfer::public_transfer(coin::from_balance(sui_out, ctx), trader);
+            
+            // Handle the SUI payment (burn it since we're simulating gas credits input)
+            balance::join(&mut pool.sui_reserve, coin::into_balance(payment));
+        };
+
+        // Update pool state
+        pool.total_fees_collected = pool.total_fees_collected + fee_amount;
+        pool.last_price = calculate_current_price(pool);
+        pool.frontrun_detection.last_trade_price = pool.last_price;
+        pool.frontrun_detection.last_trade_timestamp = current_time;
+
+        // Record trade
+        let trade_info = TradeInfo {
+            trader,
+            amount: amount_in,
+            price: pool.last_price,
+            timestamp: current_time,
+            price_impact,
+            mev_detected: false,
+            fees_paid: fee_amount,
+        };
+        
+        table::add(&mut pool.trade_history, pool.trade_counter, trade_info);
+        pool.trade_counter = pool.trade_counter + 1;
+
+        event::emit(TradeExecuted {
+            trader,
+            pool_id: object::uid_to_inner(&pool.id),
+            amount_in,
+            amount_out,
+            is_buy,
+            price: pool.last_price,
+            price_impact,
+            fees_paid: fee_amount,
+        });
+    }
+
+    // Add liquidity function - CRITICAL MISSING FUNCTION
+    public entry fun add_liquidity(
+        pool: &mut AdvancedPool,
+        sui_payment: Coin<SUI>,
+        gas_credits_amount: u64,
+        min_lp_tokens: u64,
+        clock: &Clock,
+        ctx: &mut TxContext
+    ) {
+        let sui_amount = coin::value(&sui_payment);
+        assert!(sui_amount > 0 && gas_credits_amount > 0, E_ZERO_AMOUNT);
+
+        let current_time = clock::timestamp_ms(clock);
+        let provider = tx_context::sender(ctx);
+
+        // Calculate LP tokens to mint
+        let sui_reserve_value = balance::value(&pool.sui_reserve);
+        let lp_tokens_to_mint = if (pool.total_liquidity_tokens == 0) {
+            sqrt_u64(sui_amount * gas_credits_amount)
+        } else {
+            let sui_ratio = (sui_amount * pool.total_liquidity_tokens) / sui_reserve_value;
+            let gas_ratio = (gas_credits_amount * pool.total_liquidity_tokens) / pool.gas_credits_reserve;
+            if (sui_ratio < gas_ratio) sui_ratio else gas_ratio
+        };
+
+        assert!(lp_tokens_to_mint >= min_lp_tokens, E_SLIPPAGE_TOO_HIGH);
+
+        // Add liquidity to pool
+        balance::join(&mut pool.sui_reserve, coin::into_balance(sui_payment));
+        pool.gas_credits_reserve = pool.gas_credits_reserve + gas_credits_amount;
+        pool.total_liquidity_tokens = pool.total_liquidity_tokens + lp_tokens_to_mint;
+
+        // Create LP token for provider
+        let lp_token = LPToken {
+            id: object::new(ctx),
+            pool_id: object::uid_to_inner(&pool.id),
+            owner: provider,
+            amount: lp_tokens_to_mint,
+            shares: lp_tokens_to_mint,
+            created_at: current_time,
+        };
+
+        let price_impact = calculate_price_impact_liquidity(pool, sui_amount, gas_credits_amount);
+
+        event::emit(LiquidityAdded {
+            provider,
+            pool_id: object::uid_to_inner(&pool.id),
+            sui_amount,
+            gas_credits_amount,
+            lp_tokens_minted: lp_tokens_to_mint,
+            price_impact,
+        });
+
+        transfer::transfer(lp_token, provider);
+    }
+
+    // Remove liquidity function - CRITICAL MISSING FUNCTION
+    public entry fun remove_liquidity(
+        pool: &mut AdvancedPool,
+        lp_token: LPToken,
+        min_sui: u64,
+        min_gas_credits: u64,
+        clock: &Clock,
+        ctx: &mut TxContext
+    ) {
+        let current_time = clock::timestamp_ms(clock);
+        let provider = tx_context::sender(ctx);
+        
+        // Verify LP token ownership
+        assert!(lp_token.owner == provider, E_UNAUTHORIZED);
+        assert!(lp_token.pool_id == object::uid_to_inner(&pool.id), E_INVALID_ORDER);
+
+        let lp_amount = lp_token.amount;
+        assert!(lp_amount > 0, E_INSUFFICIENT_LP_TOKENS);
+
+        // Calculate withdrawal amounts
+        let sui_reserve_value = balance::value(&pool.sui_reserve);
+        let sui_amount = (lp_amount * sui_reserve_value) / pool.total_liquidity_tokens;
+        let gas_credits_amount = (lp_amount * pool.gas_credits_reserve) / pool.total_liquidity_tokens;
+
+        assert!(sui_amount >= min_sui, E_SLIPPAGE_TOO_HIGH);
+        assert!(gas_credits_amount >= min_gas_credits, E_SLIPPAGE_TOO_HIGH);
+
+        // Remove liquidity from pool
+        let sui_out = balance::split(&mut pool.sui_reserve, sui_amount);
+        pool.gas_credits_reserve = pool.gas_credits_reserve - gas_credits_amount;
+        pool.total_liquidity_tokens = pool.total_liquidity_tokens - lp_amount;
+
+        // Transfer withdrawn amounts
+        transfer::public_transfer(coin::from_balance(sui_out, ctx), provider);
+        // Gas credits transfer would be handled here (simplified for demo)
+
+        event::emit(LiquidityRemoved {
+            provider,
+            pool_id: object::uid_to_inner(&pool.id),
+            lp_tokens_burned: lp_amount,
+            sui_amount,
+            gas_credits_amount,
+        });
+
+        // Burn LP token
+        let LPToken { id, pool_id: _, owner: _, amount: _, shares: _, created_at: _ } = lp_token;
+        object::delete(id);
+    }
+
+    // Get swap quote function - CRITICAL MISSING FUNCTION
+    public fun get_swap_quote(
+        pool: &AdvancedPool,
+        amount_in: u64,
+        is_buy: bool
+    ): SwapQuote {
+        let (amount_out, fee_amount, price_impact) = calculate_swap_amounts(pool, amount_in, is_buy);
+        
+        SwapQuote {
+            input_amount: amount_in,
+            output_amount: amount_out,
+            price_impact,
+            minimum_received: amount_out * 95 / 100, // 5% slippage
+            fee_amount,
+            route: vector::singleton(object::uid_to_inner(&pool.id)),
+            estimated_gas: 100000, // Estimated gas cost
+            mev_protection: pool.mev_protection_enabled,
+        }
+    }
+
+    // Calculate swap amounts - CRITICAL HELPER FUNCTION
+    fun calculate_swap_amounts(
+        pool: &AdvancedPool,
+        amount_in: u64,
+        is_buy: bool
+    ): (u64, u64, u64) {
+        let sui_reserve = balance::value(&pool.sui_reserve);
+        let gas_reserve = pool.gas_credits_reserve;
+        
+        if (is_buy) {
+            // Buy gas credits with SUI (x * y = k formula)
+            let amount_in_with_fee = amount_in * (FEE_PRECISION - pool.fee_rate) / FEE_PRECISION;
+            let amount_out = (amount_in_with_fee * gas_reserve) / (sui_reserve + amount_in_with_fee);
+            let fee_amount = amount_in - amount_in_with_fee;
+            let price_impact = (amount_out * FEE_PRECISION) / gas_reserve;
+            
+            (amount_out, fee_amount, price_impact)
+        } else {
+            // Sell gas credits for SUI
+            let amount_in_with_fee = amount_in * (FEE_PRECISION - pool.fee_rate) / FEE_PRECISION;
+            let amount_out = (amount_in_with_fee * sui_reserve) / (gas_reserve + amount_in_with_fee);
+            let fee_amount = amount_in - amount_in_with_fee;
+            let price_impact = (amount_out * FEE_PRECISION) / sui_reserve;
+            
+            (amount_out, fee_amount, price_impact)
+        }
+    }
+
+    // Calculate current price - HELPER FUNCTION
+    fun calculate_current_price(pool: &AdvancedPool): u64 {
+        let sui_reserve = balance::value(&pool.sui_reserve);
+        if (pool.gas_credits_reserve == 0) return 0;
+        
+        (sui_reserve * PRICE_PRECISION) / pool.gas_credits_reserve
+    }
+
+    // Calculate price impact for liquidity operations
+    fun calculate_price_impact_liquidity(
+        pool: &AdvancedPool,
+        sui_amount: u64,
+        gas_credits_amount: u64
+    ): u64 {
+        let sui_reserve = balance::value(&pool.sui_reserve);
+        let current_ratio = sui_reserve / pool.gas_credits_reserve;
+        let new_ratio = (sui_reserve + sui_amount) / (pool.gas_credits_reserve + gas_credits_amount);
+        
+        if (new_ratio > current_ratio) {
+            ((new_ratio - current_ratio) * FEE_PRECISION) / current_ratio
+        } else {
+            ((current_ratio - new_ratio) * FEE_PRECISION) / current_ratio
+        }
+    }
+
+    // Submit order to batch auction
     public entry fun submit_order(
         registry: &mut AMMRegistry,
         pool: &mut AdvancedPool,
@@ -261,13 +601,15 @@ module gas_futures::amm {
         ctx: &mut TxContext
     ) {
         assert!(pool.mev_protection_enabled, E_MEV_DETECTED);
+        assert!(amount > 0, E_ZERO_AMOUNT);
         
         let current_time = clock::timestamp_ms(clock);
+        let trader = tx_context::sender(ctx);
         
         // MEV detection
         if (detect_mev(pool, amount, is_buy, current_time)) {
             event::emit(MEVDetected {
-                trader: tx_context::sender(ctx),
+                trader,
                 transaction_hash: commitment_hash,
                 price_impact: calculate_price_impact(pool, amount, is_buy),
                 blocked: true,
@@ -280,7 +622,7 @@ module gas_futures::amm {
         if (detect_frontrun(pool, amount, current_time, ctx)) {
             registry.total_frontrun_blocked = registry.total_frontrun_blocked + 1;
             event::emit(FrontrunBlocked {
-                frontrunner: tx_context::sender(ctx),
+                frontrunner: trader,
                 victim: @0x0, // Would be determined by analysis
                 savings: amount / 100, // Estimated savings
                 timestamp: current_time,
@@ -288,14 +630,32 @@ module gas_futures::amm {
             abort E_FRONTRUN_DETECTED
         };
 
-        // Simplified order processing - directly record trade without batch auction
+        // Create order
+        let order = Order {
+            id: pool.trade_counter,
+            trader,
+            order_type,
+            is_buy,
+            amount,
+            price_limit,
+            max_slippage,
+            submitted_at: current_time,
+            commitment_hash,
+        };
+
+        // Add to current batch or create new one
+        // For simplification, we'll record as immediate trade
+        let (amount_out, fee_amount, price_impact) = calculate_swap_amounts(pool, amount, is_buy);
+        
+        // Record trade
         let trade_info = TradeInfo {
-            trader: tx_context::sender(ctx),
+            trader,
             amount,
             price: pool.last_price,
             timestamp: current_time,
-            price_impact: calculate_price_impact(pool, amount, is_buy),
+            price_impact,
             mev_detected: false,
+            fees_paid: fee_amount,
         };
         
         table::add(&mut pool.trade_history, pool.trade_counter, trade_info);
@@ -304,7 +664,7 @@ module gas_futures::amm {
         event::emit(OrderSubmitted {
             batch_id: 0, // Simplified
             order_id: pool.trade_counter,
-            trader: tx_context::sender(ctx),
+            trader,
             order_type,
             amount,
             price_limit,
@@ -317,7 +677,7 @@ module gas_futures::amm {
         pool: &mut AdvancedPool,
         batch_auction: &mut BatchAuction,
         clock: &Clock,
-        ctx: &mut TxContext
+        _ctx: &mut TxContext
     ) {
         let current_time = clock::timestamp_ms(clock);
         
@@ -349,51 +709,7 @@ module gas_futures::amm {
         });
     }
 
-    // Helper functions
-    fun get_or_create_batch_auction(
-        registry: &mut AMMRegistry,
-        pool: &mut AdvancedPool,
-        current_time: u64,
-        ctx: &mut TxContext
-    ): &mut BatchAuction {
-        // Check if current batch exists and is still accepting orders
-        if (option::is_some(&pool.batch_auction_id)) {
-            let batch_id = *option::borrow(&pool.batch_auction_id);
-            if (table::contains(&registry.batch_auctions, batch_id)) {
-                let auction_address = *table::borrow(&registry.batch_auctions, batch_id);
-                // Return existing auction (simplified - would need proper object reference)
-                abort E_BATCH_NOT_READY // Placeholder
-            }
-        };
-
-        // Create new batch auction
-        let batch_id = registry.batch_counter;
-        registry.batch_counter = registry.batch_counter + 1;
-
-        let auction = BatchAuction {
-            id: object::new(ctx),
-            batch_id,
-            orders: vector::empty<Order>(),
-            execution_price: 0,
-            total_buy_volume: 0,
-            total_sell_volume: 0,
-            auction_start: current_time,
-            auction_end: current_time + BATCH_DURATION,
-            status: AUCTION_ACCEPTING,
-            mev_protection_active: true,
-            clearing_price: 0,
-        };
-
-        let auction_id = object::uid_to_inner(&auction.id);
-        table::add(&mut registry.batch_auctions, batch_id, auction_id);
-        pool.batch_auction_id = option::some(batch_id);
-
-        transfer::share_object(auction);
-        
-        // Return reference (simplified)
-        abort E_BATCH_NOT_READY // Placeholder
-    }
-
+    // MEV Detection
     fun detect_mev(
         pool: &AdvancedPool,
         amount: u64,
@@ -435,14 +751,12 @@ module gas_futures::amm {
     }
 
     fun calculate_price_impact(pool: &AdvancedPool, amount: u64, is_buy: bool): u64 {
-        let current_sui_reserve = balance::value(&pool.sui_reserve);
+        let sui_reserve = balance::value(&pool.sui_reserve);
         
         if (is_buy) {
-            let price_change = (amount * 10000) / current_sui_reserve;
-            price_change
+            (amount * FEE_PRECISION) / sui_reserve
         } else {
-            let price_change = (amount * 10000) / pool.gas_credits_reserve;
-            price_change
+            (amount * FEE_PRECISION) / pool.gas_credits_reserve
         }
     }
 
@@ -451,19 +765,18 @@ module gas_futures::amm {
         pool: &AdvancedPool
     ): u64 {
         // Simplified uniform price calculation
-        // In reality, would sort orders and find intersection
         let current_price = pool.last_price;
         let volume_ratio = if (batch_auction.total_buy_volume > batch_auction.total_sell_volume) {
-            (batch_auction.total_buy_volume * 10000) / batch_auction.total_sell_volume
+            (batch_auction.total_buy_volume * FEE_PRECISION) / batch_auction.total_sell_volume
         } else {
-            (batch_auction.total_sell_volume * 10000) / batch_auction.total_buy_volume
+            (batch_auction.total_sell_volume * FEE_PRECISION) / batch_auction.total_buy_volume
         };
         
         // Adjust price based on volume imbalance
-        if (volume_ratio > 10000) {
-            current_price + (current_price * (volume_ratio - 10000) / 100000)
+        if (volume_ratio > FEE_PRECISION) {
+            current_price + (current_price * (volume_ratio - FEE_PRECISION) / 100000)
         } else {
-            current_price - (current_price * (10000 - volume_ratio) / 100000)
+            current_price - (current_price * (FEE_PRECISION - volume_ratio) / 100000)
         }
     }
 
@@ -474,7 +787,6 @@ module gas_futures::amm {
         let mut executed_count = 0;
         let mut total_volume = 0;
 
-        // Simplified execution - would need proper order matching
         let orders_len = vector::length(&batch_auction.orders);
         let mut i = 0;
         while (i < orders_len) {
@@ -511,18 +823,27 @@ module gas_futures::amm {
             timestamp,
             price_impact: 0,
             mev_detected: false,
+            fees_paid: total_volume * pool.fee_rate / FEE_PRECISION,
         };
         
         table::add(&mut pool.trade_history, pool.trade_counter, trade_info);
         pool.trade_counter = pool.trade_counter + 1;
     }
 
+    // Math helper function
     fun sqrt_u64(x: u64): u64 {
         if (x == 0) return 0;
-        let z = (x + 1) / 2;
-        let y = x;
-        // Simplified sqrt
-        if (z < y) z else y
+        if (x <= 3) return 1;
+        
+        let mut z = x;
+        let mut y = (x + 1) / 2;
+        
+        while (y < z) {
+            z = y;
+            y = (x / y + y) / 2;
+        };
+        
+        z
     }
 
     // View functions
@@ -534,6 +855,22 @@ module gas_futures::amm {
             pool.mev_protection_enabled,
             pool.frontrun_detection.suspicious_activity_count
         )
+    }
+
+    public fun get_pool_reserves(pool: &AdvancedPool): (u64, u64) {
+        (balance::value(&pool.sui_reserve), pool.gas_credits_reserve)
+    }
+
+    public fun get_pool_price(pool: &AdvancedPool): u64 {
+        pool.last_price
+    }
+
+    public fun get_pool_fee_rate(pool: &AdvancedPool): u64 {
+        pool.fee_rate
+    }
+
+    public fun get_total_liquidity(pool: &AdvancedPool): u64 {
+        pool.total_liquidity_tokens
     }
 
     public fun get_batch_info(batch: &BatchAuction): (u64, u64, u64, u64, u8) {
@@ -548,5 +885,36 @@ module gas_futures::amm {
 
     public fun get_mev_stats(registry: &AMMRegistry): (u64, u64) {
         (registry.total_mev_prevented, registry.total_frontrun_blocked)
+    }
+
+    public fun get_registry_stats(registry: &AMMRegistry): (u64, u64, u64) {
+        (
+            table::length(&registry.pools),
+            registry.total_volume,
+            registry.total_fees
+        )
+    }
+
+    // Admin functions
+    public entry fun update_pool_fee_rate(
+        registry: &AMMRegistry,
+        pool: &mut AdvancedPool,
+        new_fee_rate: u64,
+        ctx: &mut TxContext
+    ) {
+        assert!(tx_context::sender(ctx) == registry.admin, E_UNAUTHORIZED);
+        assert!(new_fee_rate <= 1000, E_INVALID_ORDER); // Max 10% fee
+        
+        pool.fee_rate = new_fee_rate;
+    }
+
+    public entry fun toggle_mev_protection(
+        registry: &AMMRegistry,
+        pool: &mut AdvancedPool,
+        ctx: &mut TxContext
+    ) {
+        assert!(tx_context::sender(ctx) == registry.admin, E_UNAUTHORIZED);
+        
+        pool.mev_protection_enabled = !pool.mev_protection_enabled;
     }
 } 

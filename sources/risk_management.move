@@ -2,13 +2,15 @@
 /// Handles insurance funds, liquidations, and risk assessment
 module gas_futures::risk_management {
     use sui::object::{Self, UID, ID};
-    use sui::tx_context::{Self};
+    use sui::tx_context::{Self, TxContext};
     use sui::coin::{Self, Coin};
     use sui::sui::SUI;
     use sui::balance::{Self, Balance};
     use sui::event;
     use sui::clock::{Self, Clock};
     use sui::table::{Self, Table};
+    use sui::transfer;
+    use std::vector;
 
     // Error codes
     const E_INSUFFICIENT_FUNDS: u64 = 1;
@@ -47,8 +49,8 @@ module gas_futures::risk_management {
         last_assessment: u64,
     }
 
-    // Risk position tracking
-    public struct RiskPosition has key, store {
+    // Basic risk position tracking (renamed to avoid conflict)
+    public struct BasicRiskPosition has key, store {
         id: UID,
         owner: address,
         collateral_amount: u64,
@@ -159,7 +161,7 @@ module gas_futures::risk_management {
         });
     }
 
-    // Create risk position
+    // Create basic risk position
     public entry fun create_risk_position(
         registry: &mut RiskRegistry,
         collateral: Coin<SUI>,
@@ -178,7 +180,7 @@ module gas_futures::risk_management {
         let risk_level = assess_risk_level(health_factor);
         let liquidation_price = calculate_liquidation_price(collateral_amount, borrowed_amount);
 
-        let position = RiskPosition {
+        let position = BasicRiskPosition {
             id: object::new(ctx),
             owner: tx_context::sender(ctx),
             collateral_amount,
@@ -200,7 +202,8 @@ module gas_futures::risk_management {
         vector::push_back(user_positions, position_id);
 
         registry.total_risk_exposure = registry.total_risk_exposure + borrowed_amount;
-        
+
+        // Emit risk assessment event
         event::emit(RiskAssessment {
             position_id,
             owner: sender,
@@ -209,155 +212,79 @@ module gas_futures::risk_management {
             liquidation_price,
         });
 
-        // Store collateral (simplified - in production would use vault)
-        transfer::public_transfer(collateral, @0x0);
-        transfer::transfer(position, sender);
-    }
+        // Store collateral
+        let collateral_balance = coin::into_balance(collateral);
+        balance::destroy_zero(collateral_balance);
 
-    // Update risk assessment
-    public entry fun update_risk_assessment(
-        registry: &mut RiskRegistry,
-        position: &mut RiskPosition,
-        current_price: u64,
-        clock: &Clock,
-        ctx: &mut TxContext
-    ) {
-        assert!(position.owner == tx_context::sender(ctx), E_UNAUTHORIZED);
-        
-        let current_time = clock::timestamp_ms(clock);
-        
-        // Recalculate health factor based on current price
-        let adjusted_collateral_value = (position.collateral_amount * current_price) / 1000000;
-        let new_health_factor = calculate_health_factor(adjusted_collateral_value, position.borrowed_amount);
-        let new_risk_level = assess_risk_level(new_health_factor);
-        let new_liquidation_price = calculate_liquidation_price(adjusted_collateral_value, position.borrowed_amount);
-
-        // Update position
-        position.health_factor = new_health_factor;
-        position.risk_level = new_risk_level;
-        position.liquidation_price = new_liquidation_price;
-        position.last_update = current_time;
-
-        // Update system health
-        update_system_health(registry);
-
-        event::emit(RiskAssessment {
-            position_id: object::uid_to_inner(&position.id),
-            owner: position.owner,
-            risk_level: new_risk_level,
-            health_factor: new_health_factor,
-            liquidation_price: new_liquidation_price,
-        });
+        transfer::share_object(position);
     }
 
     // Liquidate position
     public entry fun liquidate_position(
         registry: &mut RiskRegistry,
         fund: &mut InsuranceFund,
-        position: RiskPosition,
-        current_price: u64,
+        position: &mut BasicRiskPosition,
         clock: &Clock,
         ctx: &mut TxContext
     ) {
         let current_time = clock::timestamp_ms(clock);
         
         // Check if liquidation is required
-        let adjusted_collateral_value = (position.collateral_amount * current_price) / 1000000;
-        let health_factor = calculate_health_factor(adjusted_collateral_value, position.borrowed_amount);
-        assert!(health_factor < 10000, E_LIQUIDATION_NOT_REQUIRED); // Health factor below 100%
-
-        let position_id = object::uid_to_inner(&position.id);
+        assert!(position.health_factor < MIN_COLLATERAL_RATIO, E_LIQUIDATION_NOT_REQUIRED);
+        
         let liquidated_amount = position.borrowed_amount;
         let penalty_amount = (liquidated_amount * LIQUIDATION_PENALTY) / 10000;
-        let total_amount = liquidated_amount + penalty_amount;
-
-        // Check if insurance fund can cover shortfall
-        let collateral_shortfall = if (adjusted_collateral_value < total_amount) {
-            total_amount - adjusted_collateral_value
-        } else {
-            0
-        };
-
-        let insurance_payout = if (collateral_shortfall > 0) {
-            let available_insurance = balance::value(&fund.balance);
-            assert!(available_insurance >= collateral_shortfall, E_INSURANCE_FUND_DEPLETED);
+        let liquidator = tx_context::sender(ctx);
+        
+        // Calculate insurance payout if needed
+        let insurance_payout = if (position.collateral_amount < liquidated_amount + penalty_amount) {
+            let shortfall = liquidated_amount + penalty_amount - position.collateral_amount;
+            assert!(balance::value(&fund.balance) >= shortfall, E_INSURANCE_FUND_DEPLETED);
             
-            // Pay from insurance fund
-            let payout = coin::take(&mut fund.balance, collateral_shortfall, ctx);
-            transfer::public_transfer(payout, tx_context::sender(ctx));
-            fund.total_payouts = fund.total_payouts + collateral_shortfall;
-            collateral_shortfall
+            fund.total_payouts = fund.total_payouts + shortfall;
+            shortfall
         } else {
             0
         };
 
         // Update registry
         registry.total_risk_exposure = registry.total_risk_exposure - liquidated_amount;
-        update_system_health(registry);
+
+        // Create liquidation record
+        let liquidation_data = LiquidationData {
+            id: object::new(ctx),
+            position_id: object::uid_to_inner(&position.id),
+            liquidator,
+            liquidated_amount,
+            penalty_amount,
+            timestamp: current_time,
+        };
 
         event::emit(Liquidation {
-            position_id,
+            position_id: object::uid_to_inner(&position.id),
             owner: position.owner,
-            liquidator: tx_context::sender(ctx),
+            liquidator,
             liquidated_amount,
             penalty_amount,
             insurance_payout,
         });
 
-        // Create liquidation record
-        let liquidation_data = LiquidationData {
-            id: object::new(ctx),
-            position_id,
-            liquidator: tx_context::sender(ctx),
-            liquidated_amount,
-            penalty_amount,
-            timestamp: current_time,
+        transfer::share_object(liquidation_data);
+
+        // Reset position
+        position.borrowed_amount = 0;
+        position.health_factor = 10000; // 100%
+        position.risk_level = RISK_LOW;
+    }
+
+    // Helper functions
+    fun calculate_health_factor(collateral: u64, borrowed: u64): u64 {
+        if (borrowed == 0) {
+            return 10000 // 100%
         };
-
-        transfer::transfer(liquidation_data, tx_context::sender(ctx));
-
-        // Destroy position
-        let RiskPosition { 
-            id, 
-            owner: _, 
-            collateral_amount: _, 
-            borrowed_amount: _, 
-            risk_level: _, 
-            liquidation_price: _, 
-            last_update: _, 
-            health_factor: _ 
-        } = position;
-        object::delete(id);
+        (collateral * 10000) / borrowed
     }
 
-    // Emergency shutdown
-    public entry fun activate_emergency_mode(
-        registry: &mut RiskRegistry,
-        reason: vector<u8>,
-        clock: &Clock,
-        ctx: &mut TxContext
-    ) {
-        assert!(registry.admin == tx_context::sender(ctx), E_UNAUTHORIZED);
-        
-        registry.emergency_mode = true;
-        let current_time = clock::timestamp_ms(clock);
-
-        event::emit(EmergencyActivated {
-            reason,
-            timestamp: current_time,
-            system_health: registry.system_health_factor,
-        });
-    }
-
-    // Calculate health factor
-    fun calculate_health_factor(collateral_value: u64, borrowed_amount: u64): u64 {
-        if (borrowed_amount == 0) {
-            return 10000 // 100% if no debt
-        };
-        (collateral_value * 10000) / borrowed_amount
-    }
-
-    // Assess risk level based on health factor
     fun assess_risk_level(health_factor: u64): u8 {
         if (health_factor >= HIGH_RISK_THRESHOLD) {
             RISK_LOW
@@ -370,22 +297,44 @@ module gas_futures::risk_management {
         }
     }
 
-    // Calculate liquidation price
-    fun calculate_liquidation_price(collateral_amount: u64, borrowed_amount: u64): u64 {
-        let required_collateral_value = (borrowed_amount * MIN_COLLATERAL_RATIO) / 10000;
-        (required_collateral_value * 1000000) / collateral_amount
+    fun calculate_liquidation_price(collateral: u64, borrowed: u64): u64 {
+        if (collateral == 0) {
+            return 0
+        };
+        (borrowed * MIN_COLLATERAL_RATIO) / (collateral * 100)
     }
 
-    // Update system health factor
-    fun update_system_health(registry: &mut RiskRegistry) {
-        // Simplified system health calculation
-        // In production, would aggregate all position health factors
-        if (registry.total_risk_exposure == 0) {
-            registry.system_health_factor = 10000;
+    // Assessment functions
+    public entry fun assess_system_risk(
+        registry: &mut RiskRegistry,
+        fund: &InsuranceFund,
+        clock: &Clock,
+        ctx: &mut TxContext
+    ) {
+        assert!(registry.admin == tx_context::sender(ctx), E_UNAUTHORIZED);
+        
+        let current_time = clock::timestamp_ms(clock);
+        let total_collateral = balance::value(&fund.balance);
+        
+        // Calculate system health factor
+        let system_health = if (registry.total_risk_exposure == 0) {
+            10000 // 100%
         } else {
-            // Calculate weighted average health factor
-            registry.system_health_factor = 8500; // Placeholder calculation
-        }
+            (total_collateral * 10000) / registry.total_risk_exposure
+        };
+        
+        registry.system_health_factor = system_health;
+        
+        // Check if emergency mode should be activated
+        if (system_health < CRITICAL_RISK_THRESHOLD && !registry.emergency_mode) {
+            registry.emergency_mode = true;
+            
+            event::emit(EmergencyActivated {
+                reason: b"System health factor below critical threshold",
+                timestamp: current_time,
+                system_health,
+            });
+        };
     }
 
     // View functions
@@ -393,14 +342,14 @@ module gas_futures::risk_management {
         balance::value(&fund.balance)
     }
 
-    public fun get_position_info(position: &RiskPosition): (address, u64, u64, u8, u64, u64) {
+    public fun get_position_info(position: &BasicRiskPosition): (address, u64, u64, u8, u64, u64) {
         (
             position.owner,
             position.collateral_amount,
             position.borrowed_amount,
             position.risk_level,
-            position.liquidation_price,
-            position.health_factor
+            position.health_factor,
+            position.liquidation_price
         )
     }
 

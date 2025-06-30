@@ -9,6 +9,9 @@ module gas_futures::enhanced_risk {
     use sui::clock::{Self, Clock};
     use sui::event;
     use sui::table::{Self, Table};
+    use sui::transfer;
+    use std::vector;
+    use std::option::{Self, Option};
 
     // Error codes
     const E_EMERGENCY_MODE_ACTIVE: u64 = 1;
@@ -603,5 +606,269 @@ module gas_futures::enhanced_risk {
             circuit_breaker.liquidation_cascade_breaker,
             circuit_breaker.trigger_count
         )
+    }
+
+    // Reset circuit breakers after cooldown
+    public entry fun reset_circuit_breakers(
+        emergency_system: &mut EmergencySystem,
+        circuit_breaker: &mut CircuitBreaker,
+        clock: &Clock,
+        ctx: &mut TxContext
+    ) {
+        assert!(
+            emergency_system.emergency_admin == tx_context::sender(ctx),
+            E_UNAUTHORIZED
+        );
+
+        let current_time = clock::timestamp_ms(clock);
+        let time_since_trigger = current_time - emergency_system.last_emergency_timestamp;
+        
+        if (time_since_trigger >= circuit_breaker.cooldown_period) {
+            circuit_breaker.price_volatility_breaker = false;
+            circuit_breaker.volume_spike_breaker = false;
+            circuit_breaker.liquidation_cascade_breaker = false;
+            emergency_system.circuit_breakers_active = false;
+            circuit_breaker.current_daily_loss = 0;
+            circuit_breaker.last_reset_timestamp = current_time;
+        }
+    }
+
+    // Approve insurance claim  
+    public entry fun approve_insurance_claim(
+        emergency_system: &mut EmergencySystem,
+        claim: &mut InsuranceClaim,
+        approved_amount: u64,
+        ctx: &mut TxContext
+    ) {
+        assert!(
+            emergency_system.emergency_admin == tx_context::sender(ctx),
+            E_UNAUTHORIZED
+        );
+        assert!(claim.status == 1, E_UNAUTHORIZED); // Must be pending
+
+        claim.status = 2; // Approved
+        claim.payout_amount = approved_amount;
+        claim.assessor = tx_context::sender(ctx);
+
+        // Payout from insurance fund
+        if (balance::value(&emergency_system.insurance_fund) >= approved_amount) {
+            let payout = balance::split(&mut emergency_system.insurance_fund, approved_amount);
+            let payout_coin = coin::from_balance(payout, ctx);
+            transfer::public_transfer(payout_coin, claim.claimant);
+            claim.status = 4; // Paid
+        }
+    }
+
+    // Deposit to insurance fund
+    public entry fun deposit_insurance_fund(
+        emergency_system: &mut EmergencySystem,
+        deposit: Coin<SUI>,
+        ctx: &mut TxContext
+    ) {
+        let amount = coin::value(&deposit);
+        balance::join(&mut emergency_system.insurance_fund, coin::into_balance(deposit));
+    }
+
+    // Pause system operations
+    public entry fun pause_system(
+        emergency_system: &mut EmergencySystem,
+        ctx: &mut TxContext
+    ) {
+        assert!(
+            emergency_system.emergency_admin == tx_context::sender(ctx),
+            E_UNAUTHORIZED
+        );
+        emergency_system.system_paused = true;
+    }
+
+    // Resume system operations
+    public entry fun resume_system(
+        emergency_system: &mut EmergencySystem,
+        ctx: &mut TxContext
+    ) {
+        assert!(
+            emergency_system.emergency_admin == tx_context::sender(ctx),
+            E_UNAUTHORIZED
+        );
+        emergency_system.system_paused = false;
+        emergency_system.emergency_mode = false;
+    }
+
+    // Update risk thresholds
+    public entry fun update_risk_thresholds(
+        circuit_breaker: &mut CircuitBreaker,
+        new_daily_loss_limit: u64,
+        new_cooldown_period: u64,
+        ctx: &mut TxContext
+    ) {
+        circuit_breaker.daily_loss_limit = new_daily_loss_limit;
+        circuit_breaker.cooldown_period = new_cooldown_period;
+    }
+
+    // Monitor position and auto-liquidate if needed
+    public entry fun monitor_and_liquidate_position(
+        emergency_system: &mut EmergencySystem,
+        position: &mut RiskPosition,
+        risk_metrics: &mut RiskMetrics,
+        current_gas_price: u64,
+        clock: &Clock,
+        ctx: &mut TxContext
+    ) {
+        assert!(!emergency_system.system_paused, E_SYSTEM_PAUSED);
+        
+        let current_time = clock::timestamp_ms(clock);
+        
+        // Update position health based on current gas price
+        let new_exposure_value = position.gas_credits_exposure * current_gas_price / 1000000;
+        position.health_factor = calculate_health_factor(
+            new_exposure_value,
+            position.collateral_amount,
+            position.leverage_ratio
+        );
+        position.last_update = current_time;
+
+        // Auto-liquidate if health factor is below threshold and auto-liquidation is enabled
+        if (position.auto_liquidation_enabled && 
+            position.health_factor < position.liquidation_threshold) {
+            
+            let liquidation_amount = position.gas_credits_exposure / 2; // Liquidate 50%
+            trigger_liquidation(
+                emergency_system,
+                position,
+                liquidation_amount,
+                clock,
+                ctx
+            );
+        }
+    }
+
+    // Calculate system-wide concentration risk
+    public entry fun calculate_concentration_risk(
+        risk_metrics: &mut RiskMetrics,
+        largest_position_sizes: vector<u64>,
+        clock: &Clock
+    ) {
+        let current_time = clock::timestamp_ms(clock);
+        let mut total_top_10 = 0;
+        let mut i = 0;
+        let positions_count = vector::length(&largest_position_sizes);
+        let max_positions = if (positions_count > 10) 10 else positions_count;
+
+        while (i < max_positions) {
+            total_top_10 = total_top_10 + *vector::borrow(&largest_position_sizes, i);
+            i = i + 1;
+        };
+
+        // Concentration risk = top 10 positions / total exposure
+        if (risk_metrics.total_exposure > 0) {
+            risk_metrics.concentration_risk = (total_top_10 * 10000) / risk_metrics.total_exposure;
+        };
+
+        risk_metrics.last_risk_assessment = current_time;
+    }
+
+    // Update system TVL and exposure
+    public entry fun update_system_exposure(
+        risk_metrics: &mut RiskMetrics,
+        new_tvl: u64,
+        new_total_exposure: u64,
+        new_counterparty_risk: u64
+    ) {
+        risk_metrics.system_tvl = new_tvl;
+        risk_metrics.total_exposure = new_total_exposure;
+        risk_metrics.counterparty_risk = new_counterparty_risk;
+        
+        // Update operational risk based on system size
+        risk_metrics.operational_risk = if (new_tvl > 1000000000000) { // >1T MIST
+            3000 // High operational risk for large systems
+        } else if (new_tvl > 100000000000) { // >100B MIST
+            2000 // Medium operational risk
+        } else {
+            1000 // Low operational risk
+        };
+    }
+
+    // Emergency position closure
+    public entry fun emergency_close_position(
+        emergency_system: &mut EmergencySystem,
+        position: &mut RiskPosition,
+        forced_closure: bool,
+        clock: &Clock,
+        ctx: &mut TxContext
+    ) {
+        assert!(
+            emergency_system.emergency_mode || 
+            emergency_system.emergency_admin == tx_context::sender(ctx),
+            E_UNAUTHORIZED
+        );
+
+        let current_time = clock::timestamp_ms(clock);
+        let closure_penalty = if (forced_closure) {
+            position.gas_credits_exposure * 1000 / 10000 // 10% penalty for forced closure
+        } else {
+            0
+        };
+
+        // Close position
+        position.gas_credits_exposure = 0;
+        position.collateral_amount = position.collateral_amount - closure_penalty;
+        position.health_factor = 10000; // 100% healthy after closure
+        position.last_update = current_time;
+
+        event::emit(LiquidationTriggered {
+            position_id: object::uid_to_inner(&position.id),
+            owner: position.owner,
+            liquidated_amount: position.gas_credits_exposure,
+            remaining_collateral: position.collateral_amount,
+            liquidation_penalty: closure_penalty,
+            liquidator: tx_context::sender(ctx),
+        });
+    }
+
+    // Get comprehensive risk report
+    public fun get_comprehensive_risk_report(
+        emergency_system: &EmergencySystem,
+        circuit_breaker: &CircuitBreaker,
+        risk_metrics: &RiskMetrics
+    ): (u8, u64, u64, u64, bool, bool) {
+        let system_risk_level = calculate_system_risk_level(risk_metrics);
+        let insurance_coverage = balance::value(&emergency_system.insurance_fund);
+        
+        (
+            system_risk_level,
+            risk_metrics.total_exposure,
+            risk_metrics.var_95,
+            insurance_coverage,
+            emergency_system.emergency_mode,
+            emergency_system.circuit_breakers_active
+        )
+    }
+
+    // Emergency council voting (simplified)
+    public entry fun emergency_council_vote(
+        emergency_system: &mut EmergencySystem,
+        vote_type: u8, // 1: activate emergency, 2: deactivate emergency
+        ctx: &mut TxContext
+    ) {
+        let voter = tx_context::sender(ctx);
+        let mut is_council_member = false;
+        let mut i = 0;
+        
+        while (i < vector::length(&emergency_system.emergency_council)) {
+            if (*vector::borrow(&emergency_system.emergency_council, i) == voter) {
+                is_council_member = true;
+                break
+            };
+            i = i + 1;
+        };
+        
+        assert!(is_council_member, E_UNAUTHORIZED);
+        
+        // Simplified voting - in production would track individual votes
+        if (vote_type == 1) {
+            emergency_system.emergency_mode = true;
+        } else if (vote_type == 2) {
+            emergency_system.emergency_mode = false;
+        }
     }
 } 

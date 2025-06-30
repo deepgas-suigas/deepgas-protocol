@@ -9,6 +9,9 @@ module gas_futures::gas_futures {
     use sui::event;
     use sui::table::{Self, Table};
     use sui::balance::{Self, Balance};
+    use sui::transfer;
+    use std::vector;
+    use std::option::{Self, Option};
 
     // Error codes
     const E_INVALID_DURATION: u64 = 1;
@@ -20,6 +23,12 @@ module gas_futures::gas_futures {
     const E_INSUFFICIENT_GAS_CREDITS: u64 = 7;
     const E_VOUCHER_EXPIRED: u64 = 8;
     const E_INVALID_GAS_AMOUNT: u64 = 9;
+    const E_EMERGENCY_MODE: u64 = 10;
+    const E_STALE_PRICE: u64 = 11;
+    const E_PRICE_DEVIATION_TOO_HIGH: u64 = 12;
+    const E_INSUFFICIENT_RESERVES: u64 = 13;
+    const E_POSITION_TOO_LARGE: u64 = 14;
+    const E_CIRCUIT_BREAKER_ACTIVE: u64 = 15;
 
     // Contract durations in days
     const DURATION_30_DAYS: u64 = 30;
@@ -36,6 +45,11 @@ module gas_futures::gas_futures {
     const CONGESTION_MEDIUM: u8 = 2;
     const CONGESTION_HIGH: u8 = 3;
 
+    // Risk management constants
+    const MAX_PRICE_DEVIATION: u64 = 1000; // 10% max price change
+    const ORACLE_STALENESS_THRESHOLD: u64 = 300000; // 5 minutes
+    const MIN_RESERVE_RATIO: u64 = 2000; // 20% minimum reserves
+
     // Gas voucher for physical delivery
     public struct GasVoucher has key, store {
         id: UID,
@@ -51,12 +65,14 @@ module gas_futures::gas_futures {
     // Sui network gas oracle integration
     public struct SuiGasOracle has key {
         id: UID,
+        admin: address,
         current_gas_price: u64,
         congestion_level: u8,
-        validator_fees: Table<address, u64>,
         last_update: u64,
-        update_frequency: u64,
-        admin: address,
+        confidence: u64,
+        price_history: vector<PricePoint>,
+        backup_price: Option<u64>,
+        circuit_breaker_active: bool,
     }
 
     // Gas futures contract structure (enhanced)
@@ -77,16 +93,44 @@ module gas_futures::gas_futures {
     // Global state for the gas futures system (enhanced)
     public struct GasFuturesRegistry has key {
         id: UID,
-        contracts: Table<address, vector<ID>>, // user -> contract IDs
-        vouchers: Table<address, vector<ID>>, // user -> voucher IDs
+        admin: address,
         total_contracts: u64,
         total_volume: u64,
         total_gas_reserved: u64,
-        gas_reserve_pool: Balance<SUI>,
-        admin: address,
-        oracle_id: Option<ID>,
         emergency_mode: bool,
         physical_delivery_enabled: bool,
+        gas_reserve_pool: Balance<SUI>,
+        contracts: Table<address, vector<ID>>, // user -> contract IDs
+        vouchers: Table<address, vector<ID>>, // user -> voucher IDs
+        risk_params: RiskParameters,
+    }
+
+    // NEW: Risk management structure
+    public struct RiskParameters has store, drop {
+        max_position_size: u64,
+        max_total_exposure: u64,
+        liquidation_threshold: u64,
+        circuit_breaker_threshold: u64,
+        min_collateral_ratio: u64,
+    }
+
+    // NEW: External Oracle integration
+    public struct ExternalOracleConfig has store {
+        pyth_price_feed_id: vector<u8>,
+        backup_oracle_address: Option<address>,
+        price_deviation_limit: u64,
+        confidence_threshold: u64,
+        update_frequency: u64,
+    }
+
+    // NEW: Batch operation structure
+    public struct BatchOperation has drop {
+        operation_type: u8, // 1: purchase, 2: redeem, 3: use_voucher
+        contract_id: Option<ID>,
+        voucher_id: Option<ID>,
+        amount: u64,
+        duration: u64,
+        delivery_type: bool,
     }
 
     // Events (enhanced)
@@ -132,12 +176,34 @@ module gas_futures::gas_futures {
         gas_credits: u64,
     }
 
-    public struct OraclePriceUpdated has copy, drop {
-        oracle_id: ID,
+    public struct OracleUpdated has copy, drop {
         old_price: u64,
         new_price: u64,
+        price_change_percentage: u64,
         congestion_level: u8,
+        confidence: u64,
         timestamp: u64,
+    }
+
+    // NEW: Risk management events
+    public struct CircuitBreakerActivated has copy, drop {
+        timestamp: u64,
+        trigger_reason: vector<u8>,
+        current_risk_level: u64,
+    }
+
+    public struct LiquidationTriggered has copy, drop {
+        contract_id: ID,
+        owner: address,
+        liquidation_amount: u64,
+        timestamp: u64,
+    }
+
+    // Price point structure
+    public struct PricePoint has store {
+        timestamp: u64,
+        price: u64,
+        congestion: u8,
     }
 
     // Initialize the gas futures system
@@ -151,24 +217,32 @@ module gas_futures::gas_futures {
             total_gas_reserved: 0,
             gas_reserve_pool: balance::zero<SUI>(),
             admin: tx_context::sender(ctx),
-            oracle_id: option::none(),
             emergency_mode: false,
             physical_delivery_enabled: true,
+            risk_params: RiskParameters {
+                max_position_size: 1000000, // 1M gas credits
+                max_total_exposure: 10000000, // 10M gas credits
+                liquidation_threshold: 8000, // 80%
+                circuit_breaker_threshold: 5000, // 50% price movement
+                min_collateral_ratio: 1500, // 150%
+            },
         };
 
         // Initialize Sui Gas Oracle
         let oracle = SuiGasOracle {
             id: object::new(ctx),
+            admin: tx_context::sender(ctx),
             current_gas_price: 1000, // Initial price in MIST
             congestion_level: CONGESTION_LOW,
-            validator_fees: table::new(ctx),
             last_update: 0,
-            update_frequency: 300000, // 5 minutes
-            admin: tx_context::sender(ctx),
+            confidence: 10000, // 100%
+            price_history: vector::empty(),
+            backup_price: option::none(),
+            circuit_breaker_active: false,
         };
 
         let oracle_id = object::uid_to_inner(&oracle.id);
-        registry.oracle_id = option::some(oracle_id);
+        // Oracle ID is now stored within oracle structure
 
         transfer::share_object(registry);
         transfer::share_object(oracle);
@@ -183,18 +257,19 @@ module gas_futures::gas_futures {
         ctx: &mut TxContext
     ) {
         let current_time = clock::timestamp_ms(clock);
-        assert!(current_time >= oracle.last_update + oracle.update_frequency, E_UNAUTHORIZED);
+        assert!(current_time >= oracle.last_update + 300000, E_UNAUTHORIZED); // 5 minutes
         
         let old_price = oracle.current_gas_price;
         oracle.current_gas_price = new_price;
         oracle.congestion_level = congestion_level;
         oracle.last_update = current_time;
 
-        event::emit(OraclePriceUpdated {
-            oracle_id: object::uid_to_inner(&oracle.id),
+        event::emit(OracleUpdated {
             old_price,
             new_price,
+            price_change_percentage: 0, // Placeholder for price change percentage
             congestion_level,
+            confidence: 10000, // Placeholder for confidence
             timestamp: current_time,
         });
     }
@@ -453,6 +528,37 @@ module gas_futures::gas_futures {
         registry.physical_delivery_enabled = !registry.physical_delivery_enabled;
     }
 
+    // NEW: Update risk parameters
+    public entry fun update_risk_parameters(
+        registry: &mut GasFuturesRegistry,
+        max_position_size: u64,
+        max_total_exposure: u64,
+        liquidation_threshold: u64,
+        circuit_breaker_threshold: u64,
+        min_collateral_ratio: u64,
+        ctx: &mut TxContext
+    ) {
+        assert!(registry.admin == tx_context::sender(ctx), E_UNAUTHORIZED);
+        
+        let new_risk_params = RiskParameters {
+            max_position_size,
+            max_total_exposure,
+            liquidation_threshold,
+            circuit_breaker_threshold,
+            min_collateral_ratio,
+        };
+        registry.risk_params = new_risk_params;
+    }
+
+    // NEW: Reset circuit breaker
+    public entry fun reset_circuit_breaker(
+        oracle: &mut SuiGasOracle,
+        ctx: &mut TxContext
+    ) {
+        assert!(oracle.admin == tx_context::sender(ctx), E_UNAUTHORIZED);
+        oracle.circuit_breaker_active = false;
+    }
+
     // Enhanced view functions
     public fun get_contract_info(contract: &GasFuturesContract): (address, u64, u64, u64, u64, u8, u64, bool, Option<ID>) {
         (
@@ -479,8 +585,14 @@ module gas_futures::gas_futures {
         )
     }
 
-    public fun get_oracle_info(oracle: &SuiGasOracle): (u64, u8, u64) {
-        (oracle.current_gas_price, oracle.congestion_level, oracle.last_update)
+    public fun get_oracle_info(oracle: &SuiGasOracle): (u64, u8, u64, u64, bool) {
+        (
+            oracle.current_gas_price, 
+            oracle.congestion_level, 
+            oracle.last_update,
+            oracle.confidence,
+            oracle.circuit_breaker_active
+        )
     }
 
     public fun get_registry_stats(registry: &GasFuturesRegistry): (u64, u64, u64, bool, bool) {
@@ -491,5 +603,31 @@ module gas_futures::gas_futures {
             registry.emergency_mode,
             registry.physical_delivery_enabled
         )
+    }
+
+    // NEW: Get risk parameters
+    public fun get_risk_parameters(registry: &GasFuturesRegistry): (u64, u64, u64, u64, u64) {
+        (
+            registry.risk_params.max_position_size,
+            registry.risk_params.max_total_exposure,
+            registry.risk_params.liquidation_threshold,
+            registry.risk_params.circuit_breaker_threshold,
+            registry.risk_params.min_collateral_ratio
+        )
+    }
+
+    // NEW: Get price history
+    public fun get_price_history(oracle: &SuiGasOracle): &vector<PricePoint> {
+        &oracle.price_history
+    }
+
+    // NEW: Calculate current premium
+    public fun calculate_current_premium(
+        oracle: &SuiGasOracle,
+        gas_credits: u64,
+        duration_days: u64
+    ): u64 {
+        let base_price = gas_credits * oracle.current_gas_price;
+        calculate_dynamic_premium(base_price, duration_days, oracle.congestion_level)
     }
 }
